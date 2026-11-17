@@ -28,12 +28,13 @@ import 'package:media_kit/src/models/playlist.dart';
 import 'package:media_kit/src/models/track.dart';
 import 'package:media_kit/src/models/video_params.dart';
 import 'package:media_kit/src/player/native/core/fallback_bitrate_handler.dart';
+import 'package:media_kit/src/player/native/core/native_event_loop.dart';
 import 'package:media_kit/src/player/native/core/initializer.dart';
+import 'package:media_kit/src/player/native/utils/native_reference_holder.dart';
 import 'package:media_kit/src/player/native/core/native_library.dart';
 import 'package:media_kit/src/player/native/utils/android_asset_loader.dart';
 import 'package:media_kit/src/player/native/utils/android_helper.dart';
 import 'package:media_kit/src/player/native/utils/isolates.dart';
-import 'package:media_kit/src/player/native/utils/native_reference_holder.dart';
 import 'package:media_kit/src/player/native/utils/temp_file.dart';
 import 'package:media_kit/src/player/platform_player.dart';
 
@@ -43,34 +44,36 @@ import 'package:media_kit/generated/libmpv/bindings.dart' as generated;
 void nativeEnsureInitialized({String? libmpv}) {
   AndroidHelper.ensureInitialized();
   NativeLibrary.ensureInitialized(libmpv: libmpv);
-  NativeReferenceHolder.ensureInitialized((references) async {
-    if (references.isEmpty) {
-      return;
-    }
-    const tag = NativeReferenceHolder.kTag;
-    print('$tag Found ${references.length} reference(s).');
-    print('$tag Disposing:\n${references.map((e) => e.address).join('\n')}');
-
-    // First, clear wakeup callbacks on all old handles to prevent mpv from
-    // invoking deleted Dart NativeCallable trampolines (SIGABRT on Flutter 3.38+).
-    // mpv_set_wakeup_callback is synchronous: once it returns, mpv will never
-    // call the old (dead) trampoline again.
-    // See: https://github.com/media-kit/media-kit/issues/1314
-    final mpv = generated.MPV(DynamicLibrary.open(NativeLibrary.path));
-    for (final reference in references) {
-      mpv.mpv_set_wakeup_callback(reference.cast(), nullptr, nullptr);
-    }
-
-    // Now it's safe to send quit; mpv won't try to notify Dart anymore.
-    final cmd = 'quit'.toNativeUtf8();
-    try {
-      for (final reference in references) {
-        mpv.mpv_command_string(reference.cast(), cmd.cast());
+  if (!Platform.isAndroid) {
+    NativeReferenceHolder.ensureInitialized((references) async {
+      if (references.isEmpty) {
+        return;
       }
-    } finally {
-      calloc.free(cmd);
-    }
-  });
+      const tag = NativeReferenceHolder.kTag;
+      print('$tag Found ${references.length} reference(s).');
+      print('$tag Disposing:\n${references.map((e) => e.address).join('\n')}');
+
+      // First, clear wakeup callbacks on all old handles to prevent mpv from
+      // invoking deleted Dart NativeCallable trampolines (SIGABRT on Flutter 3.38+).
+      // mpv_set_wakeup_callback is synchronous: once it returns, mpv will never
+      // call the old (dead) trampoline again.
+      // See: https://github.com/media-kit/media-kit/issues/1314
+      final mpv = generated.MPV(DynamicLibrary.open(NativeLibrary.path));
+      for (final reference in references) {
+        mpv.mpv_set_wakeup_callback(reference.cast(), nullptr, nullptr);
+      }
+
+      // Now it's safe to send quit; mpv won't try to notify Dart anymore.
+      final cmd = 'quit'.toNativeUtf8();
+      try {
+        for (final reference in references) {
+          mpv.mpv_command_string(reference.cast(), cmd.cast());
+        }
+      } finally {
+        calloc.free(cmd);
+      }
+    });
+  }
 }
 
 /// {@template native_player}
@@ -85,17 +88,60 @@ class NativePlayer extends PlatformPlayer {
   /// {@macro native_player}
   NativePlayer({required super.configuration})
       : mpv = generated.MPV(DynamicLibrary.open(NativeLibrary.path)) {
-    future = _create()
-      ..then((_) {
-        try {
-          configuration.ready?.call();
-        } catch (_) {}
-      });
+    future = _create();
+    unawaited(
+      future!.then(
+        (_) {
+          try {
+            configuration.ready?.call();
+          } catch (_) {}
+        },
+        onError: (Object error, StackTrace stack) {
+          if (!errorController.isClosed) errorController.add(error.toString());
+        },
+      ),
+    );
   }
 
   /// Disposes the [Player] instance & releases the resources.
   @override
   Future<void> dispose({bool synchronized = true}) {
+    if (!_usesNativeEventLoop) {
+      return _disposeLegacy(synchronized: synchronized);
+    }
+    Future<void> function() async {
+      try {
+        await waitForPlayerInitialization;
+        await waitForVideoControllerInitializationIfAttached;
+        await stop(notify: false, synchronized: false);
+      } finally {
+        disposed = true;
+        try {
+          // Release video render contexts before shutting down the mpv core.
+          await super.dispose();
+        } finally {
+          await _eventLoop?.dispose();
+          ctx = nullptr;
+          _eventLoop = null;
+          for (final request in [
+            ..._setPropertyRequests.values,
+            ..._commandRequests.values,
+            ..._screenshotRequests.values.map((request) => request.completer),
+          ]) {
+            request.completeError(StateError('Player has been disposed'));
+          }
+          _setPropertyRequests.clear();
+          _commandRequests.clear();
+          _screenshotRequests.clear();
+        }
+      }
+    }
+
+    return _disposeFuture ??=
+        synchronized ? lock.synchronized(function) : function();
+  }
+
+  Future<void> _disposeLegacy({bool synchronized = true}) {
     Future<void> function() async {
       if (disposed) {
         throw AssertionError('[Player] has been disposed');
@@ -122,6 +168,13 @@ class NativePlayer extends PlatformPlayer {
     } else {
       return function();
     }
+  }
+
+  @override
+  Future<void> get waitForPlayerInitialization async {
+    // A failed create must propagate instead of waiting forever for idle-active.
+    await future;
+    await super.waitForPlayerInitialization;
   }
 
   /// Opens a [Media] or [Playlist] into the [Player].
@@ -1171,16 +1224,13 @@ class NativePlayer extends PlatformPlayer {
   /// If [includeLibassSubtitles] is `true` *and* [PlayerConfiguration.libass] is `true`, then the
   /// screenshot will include the on-screen subtitles.
   @override
-  Future<Uint8List?> screenshot(
-      {String? format = 'image/jpeg',
-      bool synchronized = true,
-      bool includeLibassSubtitles = false}) async {
+  Future<Uint8List?> screenshot({
+    String? format = 'image/jpeg',
+    bool synchronized = true,
+    bool includeLibassSubtitles = false,
+  }) async {
     Future<Uint8List?> function() async {
-      if (![
-        'image/jpeg',
-        'image/png',
-        null,
-      ].contains(format)) {
+      if (!['image/jpeg', 'image/png', null].contains(format)) {
         throw ArgumentError.value(
           format,
           'format',
@@ -1194,15 +1244,10 @@ class NativePlayer extends PlatformPlayer {
       await waitForPlayerInitialization;
       await waitForVideoControllerInitializationIfAttached;
 
-      return compute(
-        _screenshot,
-        _ScreenshotData(
-          ctx.address,
-          NativeLibrary.path,
-          format,
-          includeLibassSubtitles,
-        ),
-      );
+      _checkNativeHandle();
+      // Only owned pixels may cross into the encoding isolate.
+      final data = await _captureScreenshot(format, includeLibassSubtitles);
+      return data == null ? null : compute(_encodeScreenshot, data);
     }
 
     if (synchronized) {
@@ -1253,6 +1298,7 @@ class NativePlayer extends PlatformPlayer {
     // video-output re-initialization & hardware decoder creation run on the
     // Dart UI thread, freezing it for hundreds of milliseconds.
     // See: https://github.com/media-kit/media-kit/issues/1395
+    _checkNativeHandle();
     await _setPropertyString(property, value);
   }
 
@@ -1275,6 +1321,7 @@ class NativePlayer extends PlatformPlayer {
       await waitForPlayerInitialization;
       await waitForVideoControllerInitializationIfAttached;
     }
+    _checkNativeHandle();
 
     final name = property.toNativeUtf8();
     try {
@@ -1312,6 +1359,7 @@ class NativePlayer extends PlatformPlayer {
       await waitForPlayerInitialization;
       await waitForVideoControllerInitializationIfAttached;
     }
+    _checkNativeHandle();
 
     if (observedProperties.containsKey(property)) {
       throw ArgumentError.value(
@@ -1351,6 +1399,7 @@ class NativePlayer extends PlatformPlayer {
       await waitForPlayerInitialization;
       await waitForVideoControllerInitializationIfAttached;
     }
+    _checkNativeHandle();
 
     if (!observedProperties.containsKey(property)) {
       throw ArgumentError.value(
@@ -1383,6 +1432,7 @@ class NativePlayer extends PlatformPlayer {
       await waitForPlayerInitialization;
       await waitForVideoControllerInitializationIfAttached;
     }
+    _checkNativeHandle();
 
     if (observedEvents.containsKey(event)) {
       throw ArgumentError.value(
@@ -1413,6 +1463,7 @@ class NativePlayer extends PlatformPlayer {
       await waitForPlayerInitialization;
       await waitForVideoControllerInitializationIfAttached;
     }
+    _checkNativeHandle();
 
     if (!observedEvents.containsKey(event)) {
       throw ArgumentError.value(
@@ -1443,6 +1494,7 @@ class NativePlayer extends PlatformPlayer {
       await waitForPlayerInitialization;
       await waitForVideoControllerInitializationIfAttached;
     }
+    _checkNativeHandle();
 
     await _command(command);
   }
@@ -1521,12 +1573,30 @@ class NativePlayer extends PlatformPlayer {
       }
     }
     if (event.ref.event_id == generated.mpv_event_id.MPV_EVENT_COMMAND_REPLY) {
-      final completer = _commandRequests.remove(event.ref.reply_userdata);
-      if (completer == null) {
-        print(
-            'Warning: Received MPV_EVENT_COMMAND_REPLY with unregistered ID ${event.ref.reply_userdata}');
+      final screenshot = _screenshotRequests.remove(event.ref.reply_userdata);
+      if (screenshot != null) {
+        try {
+          final data = event.ref.data;
+          screenshot.completer.complete(
+            event.ref.error < 0 || data == nullptr
+                ? null
+                : _copyScreenshot(
+                    data.cast<generated.mpv_event_command>().ref.result,
+                    screenshot.format,
+                  ),
+          );
+        } catch (error, stack) {
+          screenshot.completer.completeError(error, stack);
+        }
       } else {
-        completer.complete(event.ref.error);
+        final completer = _commandRequests.remove(event.ref.reply_userdata);
+        if (completer == null) {
+          print(
+            'Warning: Received MPV_EVENT_COMMAND_REPLY with unregistered ID ${event.ref.reply_userdata}',
+          );
+        } else {
+          completer.complete(event.ref.error);
+        }
       }
     }
 
@@ -2405,22 +2475,17 @@ class NativePlayer extends PlatformPlayer {
           // On Android, the system fonts cannot be picked up by libass/fontconfig. This makes libass subtitle rendering fail.
           // We save the subtitle font to the application's cache directory and set `config` & `config-dir` to use it.
           final subfont = await AndroidAssetLoader.load(
-            join(
-              'flutter_assets',
-              configuration.libassAndroidFont,
-            ),
+            join('flutter_assets', configuration.libassAndroidFont),
           );
           if (subfont.isNotEmpty) {
             final directory = dirname(subfont);
             // This asset is bundled as part of `package:media_kit_libs_android_video`.
             // Use it if located inside the application bundle, otherwise no worries.
-            options.addAll(
-              {
-                'config': 'yes',
-                'sub-fonts-dir': directory,
-                'sub-font': configuration.libassAndroidFontName ?? '',
-              },
-            );
+            options.addAll({
+              'config': 'yes',
+              'sub-fonts-dir': directory,
+              'sub-font': configuration.libassAndroidFontName ?? '',
+            });
             print(subfont);
             print(directory);
           }
@@ -2430,69 +2495,71 @@ class NativePlayer extends PlatformPlayer {
         }
       }
 
-      ctx = await Initializer(mpv).create(
-        _handler,
-        options: options,
-      );
-
-      // ALL:
-      //
-      // idle = yes
-      // pause = yes
-      // keep-open = yes
-      // audio-display = no
-      // network-timeout = 5
-      // scale=bilinear
-      // dscale=bilinear
-      // dither=no
-      // correct-downscaling=no
-      // linear-downscaling=no
-      // sigmoid-upscaling=no
-      // hdr-compute-peak=no
-      //
-      // ANDROID (Physical Device OR API Level > 25):
-      //
-      // ao = opensles
-      //
-      // ANDROID (Emulator AND API Level <= 25):
-      //
-      // ao = null
-      //
-      final properties = <String, String>{
-        'idle': 'yes',
-        'pause': 'yes',
-        'keep-open': 'yes',
-        'audio-display': 'no',
-        'network-timeout': '5',
-        // https://github.com/mpv-player/mpv/commit/703f1588803eaa428e09c0e5547b26c0fff476a7
-        // https://github.com/mpv-android/mpv-android/commit/9e5c3d8a630290fc41edb8b03aeafa3bc4c45955
-        'scale': 'bilinear',
-        'dscale': 'bilinear',
-        'dither': 'no',
-        'cache': 'yes',
-        'cache-on-disk': 'yes',
-        'hr-seek': 'yes',
-        'hr-seek-framedrop': 'no',
-        'correct-downscaling': 'no',
-        'linear-downscaling': 'no',
-        'sigmoid-upscaling': 'no',
-        'hdr-compute-peak': 'no',
-        if (AndroidHelper.isPhysicalDevice || AndroidHelper.APILevel > 25)
-          'ao': 'opensles'
-        // Disable audio output on older Android emulators with API Level < 25.
-        // OpenSL ES audio output seems to be broken on some of these.
-        else if (AndroidHelper.isEmulator && AndroidHelper.APILevel <= 25)
-          'ao': 'null',
-        'subs-fallback': 'yes',
-        'subs-with-matching-audio': 'yes',
-      };
-      // Other properties based on [PlayerConfiguration].
-      properties.addAll(
-        {
-          if (!configuration.osc) ...{
-            'osc': 'no',
-            'osd-level': '0',
-          },
+      final eventLoop = _usesNativeEventLoop
+          ? await NativeEventLoop.create(
+              DynamicLibrary.open(NativeLibrary.path),
+              _handler,
+              options: options,
+            )
+          : null;
+      _eventLoop = eventLoop;
+      ctx = eventLoop?.handle ??
+          await Initializer(mpv).create(_handler, options: options);
+      try {
+        // ALL:
+        //
+        // idle = yes
+        // pause = yes
+        // keep-open = yes
+        // audio-display = no
+        // network-timeout = 5
+        // scale=bilinear
+        // dscale=bilinear
+        // dither=no
+        // correct-downscaling=no
+        // linear-downscaling=no
+        // sigmoid-upscaling=no
+        // hdr-compute-peak=no
+        //
+        // ANDROID (Physical Device OR API Level > 25):
+        //
+        // ao = opensles
+        //
+        // ANDROID (Emulator AND API Level <= 25):
+        //
+        // ao = null
+        //
+        final properties = <String, String>{
+          'idle': 'yes',
+          'pause': 'yes',
+          'keep-open': 'yes',
+          'audio-display': 'no',
+          'network-timeout': '5',
+          // https://github.com/mpv-player/mpv/commit/703f1588803eaa428e09c0e5547b26c0fff476a7
+          // https://github.com/mpv-android/mpv-android/commit/9e5c3d8a630290fc41edb8b03aeafa3bc4c45955
+          'scale': 'bilinear',
+          'dscale': 'bilinear',
+          'dither': 'no',
+          'cache': 'yes',
+          'cache-on-disk': 'yes',
+          'hr-seek': 'yes',
+          'hr-seek-framedrop': 'no',
+          'correct-downscaling': 'no',
+          'linear-downscaling': 'no',
+          'sigmoid-upscaling': 'no',
+          'hdr-compute-peak': 'no',
+          if (AndroidHelper.isPhysicalDevice || AndroidHelper.APILevel > 25)
+            'ao': 'opensles'
+          // Disable audio output on older Android emulators with API Level < 25.
+          // OpenSL ES audio output seems to be broken on some of these.
+          else if (AndroidHelper.isEmulator && AndroidHelper.APILevel <= 25)
+            'ao': 'null',
+          'subs-fallback': 'yes',
+          'subs-with-matching-audio': 'yes',
+        };
+        // Other properties based on [PlayerConfiguration].
+        properties.addAll({
+          if (!configuration.osc) ...{'osc': 'no', 'osd-level': '0'},
           'title': configuration.title,
           'demuxer-max-bytes': configuration.bufferSize.toString(),
           'demuxer-max-back-bytes': configuration.bufferSize.toString(),
@@ -2501,92 +2568,93 @@ class NativePlayer extends PlatformPlayer {
             'seg_max_retry=5',
             'strict=experimental',
             'allowed_extensions=ALL',
-            'protocol_whitelist=[${configuration.protocolWhitelist.join(',')}]'
+            'protocol_whitelist=[${configuration.protocolWhitelist.join(',')}]',
           ].join(','),
           'sub-ass': configuration.libass ? 'yes' : 'no',
           'sub-visibility': configuration.libass ? 'yes' : 'no',
           'secondary-sub-visibility': configuration.libass ? 'yes' : 'no',
-        },
-      );
+        });
 
-      if (test) {
-        properties['vo'] = 'null';
-        properties['ao'] = 'null';
-      }
-
-      await Future.wait(properties.entries
-          .map((entry) => _setPropertyString(entry.key, entry.value)));
-
-      if (configuration.muted) {
-        await _setPropertyDouble('volume', 0);
-
-        state = state.copyWith(volume: 0.0);
-        if (!volumeController.isClosed) {
-          volumeController.add(0.0);
+        if (test) {
+          properties['vo'] = 'null';
+          properties['ao'] = 'null';
         }
-      }
 
-      // Observe the properties to update the state & feed event stream.
-      <String, int>{
-        'pause': generated.mpv_format.MPV_FORMAT_FLAG,
-        'time-pos': generated.mpv_format.MPV_FORMAT_DOUBLE,
-        'duration': generated.mpv_format.MPV_FORMAT_DOUBLE,
-        'playlist-playing-pos': generated.mpv_format.MPV_FORMAT_INT64,
-        'volume': generated.mpv_format.MPV_FORMAT_DOUBLE,
-        'speed': generated.mpv_format.MPV_FORMAT_DOUBLE,
-        'core-idle': generated.mpv_format.MPV_FORMAT_FLAG,
-        'paused-for-cache': generated.mpv_format.MPV_FORMAT_FLAG,
-        'demuxer-cache-time': generated.mpv_format.MPV_FORMAT_DOUBLE,
-        'cache-buffering-state': generated.mpv_format.MPV_FORMAT_DOUBLE,
-        'audio-params': generated.mpv_format.MPV_FORMAT_NODE,
-        'audio-bitrate': generated.mpv_format.MPV_FORMAT_DOUBLE,
-        'audio-device': generated.mpv_format.MPV_FORMAT_NODE,
-        'audio-device-list': generated.mpv_format.MPV_FORMAT_NODE,
-        'video-params': generated.mpv_format.MPV_FORMAT_NODE,
-        'track-list': generated.mpv_format.MPV_FORMAT_NODE,
-        'eof-reached': generated.mpv_format.MPV_FORMAT_FLAG,
-        'idle-active': generated.mpv_format.MPV_FORMAT_FLAG,
-        'sub-text': generated.mpv_format.MPV_FORMAT_NODE,
-        'secondary-sub-text': generated.mpv_format.MPV_FORMAT_NODE,
-      }.forEach(
-        (property, format) {
+        await Future.wait(
+          properties.entries.map(
+            (entry) => _setPropertyString(entry.key, entry.value),
+          ),
+        );
+
+        if (configuration.muted) {
+          await _setPropertyDouble('volume', 0);
+
+          state = state.copyWith(volume: 0.0);
+          if (!volumeController.isClosed) {
+            volumeController.add(0.0);
+          }
+        }
+
+        // Observe the properties to update the state & feed event stream.
+        <String, int>{
+          'pause': generated.mpv_format.MPV_FORMAT_FLAG,
+          'time-pos': generated.mpv_format.MPV_FORMAT_DOUBLE,
+          'duration': generated.mpv_format.MPV_FORMAT_DOUBLE,
+          'playlist-playing-pos': generated.mpv_format.MPV_FORMAT_INT64,
+          'volume': generated.mpv_format.MPV_FORMAT_DOUBLE,
+          'speed': generated.mpv_format.MPV_FORMAT_DOUBLE,
+          'core-idle': generated.mpv_format.MPV_FORMAT_FLAG,
+          'paused-for-cache': generated.mpv_format.MPV_FORMAT_FLAG,
+          'demuxer-cache-time': generated.mpv_format.MPV_FORMAT_DOUBLE,
+          'cache-buffering-state': generated.mpv_format.MPV_FORMAT_DOUBLE,
+          'audio-params': generated.mpv_format.MPV_FORMAT_NODE,
+          'audio-bitrate': generated.mpv_format.MPV_FORMAT_DOUBLE,
+          'audio-device': generated.mpv_format.MPV_FORMAT_NODE,
+          'audio-device-list': generated.mpv_format.MPV_FORMAT_NODE,
+          'video-params': generated.mpv_format.MPV_FORMAT_NODE,
+          'track-list': generated.mpv_format.MPV_FORMAT_NODE,
+          'eof-reached': generated.mpv_format.MPV_FORMAT_FLAG,
+          'idle-active': generated.mpv_format.MPV_FORMAT_FLAG,
+          'sub-text': generated.mpv_format.MPV_FORMAT_NODE,
+          'secondary-sub-text': generated.mpv_format.MPV_FORMAT_NODE,
+        }.forEach((property, format) {
           final reply = property.hashCode;
           final name = property.toNativeUtf8();
-          mpv.mpv_observe_property(
-            ctx,
-            reply,
-            name.cast(),
-            format,
-          );
+          mpv.mpv_observe_property(ctx, reply, name.cast(), format);
           calloc.free(name);
-        },
-      );
+        });
 
-      // https://github.com/mpv-player/mpv/blob/e1727553f164181265f71a20106fbd5e34fa08b0/libmpv/client.h#L1410-L1419
-      final levels = {
-        MPVLogLevel.error: 'error',
-        MPVLogLevel.warn: 'warn',
-        MPVLogLevel.info: 'info',
-        MPVLogLevel.v: 'v',
-        MPVLogLevel.debug: 'debug',
-        MPVLogLevel.trace: 'trace',
-      };
-      final level = levels[configuration.logLevel];
-      if (level != null) {
-        final min = level.toNativeUtf8();
-        mpv.mpv_request_log_messages(ctx, min.cast());
-        calloc.free(min);
+        // https://github.com/mpv-player/mpv/blob/e1727553f164181265f71a20106fbd5e34fa08b0/libmpv/client.h#L1410-L1419
+        final levels = {
+          MPVLogLevel.error: 'error',
+          MPVLogLevel.warn: 'warn',
+          MPVLogLevel.info: 'info',
+          MPVLogLevel.v: 'v',
+          MPVLogLevel.debug: 'debug',
+          MPVLogLevel.trace: 'trace',
+        };
+        final level = levels[configuration.logLevel];
+        if (level != null) {
+          final min = level.toNativeUtf8();
+          mpv.mpv_request_log_messages(ctx, min.cast());
+          calloc.free(min);
+        }
+
+        // Add libmpv hooks for supporting custom HTTP headers in [Media].
+        final load = 'on_load'.toNativeUtf8();
+        final unload = 'on_unload'.toNativeUtf8();
+        mpv.mpv_hook_add(ctx, 0, load.cast(), 0);
+        mpv.mpv_hook_add(ctx, 0, unload.cast(), 0);
+        calloc.free(load);
+        calloc.free(unload);
+
+        if (eventLoop == null) await NativeReferenceHolder.instance.add(ctx);
+      } catch (_) {
+        await eventLoop?.dispose();
+        ctx = nullptr;
+        _eventLoop = null;
+        rethrow;
       }
-
-      // Add libmpv hooks for supporting custom HTTP headers in [Media].
-      final load = 'on_load'.toNativeUtf8();
-      final unload = 'on_unload'.toNativeUtf8();
-      mpv.mpv_hook_add(ctx, 0, load.cast(), 0);
-      mpv.mpv_hook_add(ctx, 0, unload.cast(), 0);
-      calloc.free(load);
-      calloc.free(unload);
-
-      await NativeReferenceHolder.instance.add(ctx);
     });
   }
 
@@ -2608,34 +2676,76 @@ class NativePlayer extends PlatformPlayer {
   final Map<int, Completer<int>> _setPropertyRequests = {};
   final Map<int, Completer<int>> _commandRequests = {};
 
+  final Map<int, _ScreenshotRequest> _screenshotRequests = {};
+
+  Future<_ScreenshotData?> _captureScreenshot(
+    String? format,
+    bool includeLibassSubtitles,
+  ) async {
+    _checkNativeHandle();
+    final requestNumber = _asyncRequestNumber++;
+    final request = _screenshotRequests[requestNumber] = _ScreenshotRequest(
+      format,
+    );
+    final args = [
+      'screenshot-raw',
+      includeLibassSubtitles ? 'subtitles' : 'video',
+    ];
+    final pointers = args.map((arg) => arg.toNativeUtf8()).toList();
+    final arr = calloc<Pointer<Utf8>>(pointers.length + 1);
+    try {
+      int immediate;
+      try {
+        for (var i = 0; i < pointers.length; i++) {
+          arr[i] = pointers[i];
+        }
+        // Enqueue on the mpv core without blocking the Dart event consumer.
+        immediate = mpv.mpv_command_async(ctx, requestNumber, arr.cast());
+      } finally {
+        calloc.free(arr);
+        pointers.forEach(calloc.free);
+      }
+      if (immediate < 0) {
+        _logError(immediate, 'screenshot-raw');
+        return null;
+      }
+      return await request.completer.future;
+    } finally {
+      _screenshotRequests.remove(requestNumber);
+    }
+  }
+
+  void _checkNativeHandle() {
+    if (disposed || ctx == nullptr) {
+      throw StateError('Player has been disposed or failed to initialize');
+    }
+  }
+
   Future<void> _setProperty(String name, int format, Pointer<Void> data) async {
+    _checkNativeHandle();
     final namePtr = name.toNativeUtf8();
     try {
       if (configuration.async) {
         final requestNumber = _asyncRequestNumber++;
         final completer =
             _setPropertyRequests[requestNumber] = Completer<int>();
-        final immediate = mpv.mpv_set_property_async(
-          ctx,
-          requestNumber,
-          namePtr.cast(),
-          format,
-          data,
-        );
-        final text = '_setProperty($name, $format)';
-        if (immediate < 0) {
-          // Sending failed, so no reply event will remove this request.
+        try {
+          final immediate = mpv.mpv_set_property_async(
+            ctx,
+            requestNumber,
+            namePtr.cast(),
+            format,
+            data,
+          );
+          final result = immediate < 0 ? immediate : await completer.future;
+          _logError(result, '_setProperty($name, $format)');
+        } finally {
           _setPropertyRequests.remove(requestNumber);
-          _logError(immediate, text);
-          return;
         }
-        _logError(await completer.future, text);
       } else {
-        mpv.mpv_set_property(
-          ctx,
-          namePtr.cast(),
-          format,
-          data,
+        _logError(
+          mpv.mpv_set_property(ctx, namePtr.cast(), format, data),
+          '_setProperty($name, $format)',
         );
       }
     } finally {
@@ -2644,71 +2754,88 @@ class NativePlayer extends PlatformPlayer {
   }
 
   Future<void> _setPropertyFlag(String name, bool value) async {
-    final ptr = calloc<Bool>(1)..value = value;
-    await _setProperty(
-      name,
-      generated.mpv_format.MPV_FORMAT_FLAG,
-      ptr.cast(),
-    );
-    calloc.free(ptr);
+    // MPV_FORMAT_FLAG is an int, not a one-byte C bool.
+    final ptr = calloc<Int32>()..value = value ? 1 : 0;
+    try {
+      await _setProperty(
+        name,
+        generated.mpv_format.MPV_FORMAT_FLAG,
+        ptr.cast(),
+      );
+    } finally {
+      calloc.free(ptr);
+    }
   }
 
   Future<void> _setPropertyDouble(String name, double value) async {
-    final ptr = calloc<Double>(1)..value = value;
-    await _setProperty(
-      name,
-      generated.mpv_format.MPV_FORMAT_DOUBLE,
-      ptr.cast(),
-    );
-    calloc.free(ptr);
+    final ptr = calloc<Double>()..value = value;
+    try {
+      await _setProperty(
+        name,
+        generated.mpv_format.MPV_FORMAT_DOUBLE,
+        ptr.cast(),
+      );
+    } finally {
+      calloc.free(ptr);
+    }
   }
 
   Future<void> _setPropertyInt64(String name, int value) async {
-    final ptr = calloc<Int64>(1)..value = value;
-    await _setProperty(
-      name,
-      generated.mpv_format.MPV_FORMAT_INT64,
-      ptr.cast(),
-    );
-    calloc.free(ptr);
+    final ptr = calloc<Int64>()..value = value;
+    try {
+      await _setProperty(
+        name,
+        generated.mpv_format.MPV_FORMAT_INT64,
+        ptr.cast(),
+      );
+    } finally {
+      calloc.free(ptr);
+    }
   }
 
   Future<void> _setPropertyString(String name, String value) async {
     final string = value.toNativeUtf8();
     // API requires char**.
-    final ptr = calloc<Pointer<Void>>(1);
-    ptr.value = Pointer.fromAddress(string.address);
-    await _setProperty(
-      name,
-      generated.mpv_format.MPV_FORMAT_STRING,
-      ptr.cast(),
-    );
-    calloc.free(ptr);
-    calloc.free(string);
+    final ptr = calloc<Pointer<Void>>()..value = string.cast();
+    try {
+      await _setProperty(
+        name,
+        generated.mpv_format.MPV_FORMAT_STRING,
+        ptr.cast(),
+      );
+    } finally {
+      calloc.free(ptr);
+      calloc.free(string);
+    }
   }
 
   Future<void> _command(List<String> args) async {
-    final pointers = args.map<Pointer<Utf8>>((e) => e.toNativeUtf8()).toList();
-    final arr = calloc<Pointer<Utf8>>(128);
+    _checkNativeHandle();
+    final pointers = args.map((e) => e.toNativeUtf8()).toList();
+    final arr = calloc<Pointer<Utf8>>(args.length + 1);
     try {
       for (int i = 0; i < args.length; i++) {
-        (arr + i).value = pointers[i];
+        arr[i] = pointers[i];
       }
-
       if (configuration.async) {
         final requestNumber = _asyncRequestNumber++;
         final completer = _commandRequests[requestNumber] = Completer<int>();
-        final immediate = mpv.mpv_command_async(ctx, requestNumber, arr.cast());
-        final text = '_command(${args.join(', ')})';
-        if (immediate < 0) {
-          // Sending failed, so no reply event will remove this request.
+        try {
+          final immediate = mpv.mpv_command_async(
+            ctx,
+            requestNumber,
+            arr.cast(),
+          );
+          final result = immediate < 0 ? immediate : await completer.future;
+          _logError(result, '_command(${args.join(', ')})');
+        } finally {
           _commandRequests.remove(requestNumber);
-          _logError(immediate, text);
-          return;
         }
-        _logError(await completer.future, text);
       } else {
-        mpv.mpv_command(ctx, arr.cast());
+        _logError(
+          mpv.mpv_command(ctx, arr.cast()),
+          '_command(${args.join(', ')})',
+        );
       }
     } finally {
       calloc.free(arr);
@@ -2736,6 +2863,12 @@ class NativePlayer extends PlatformPlayer {
 
   /// [Pointer] to [generated.mpv_handle] of this instance.
   Pointer<generated.mpv_handle> ctx = nullptr;
+
+  // Keep desktop/Apple renderer teardown unchanged in this Android TV fork.
+  // The existing native test mode also exercises Android ownership on the host.
+  final bool _usesNativeEventLoop = Platform.isAndroid || test;
+  NativeEventLoop? _eventLoop;
+  Future<void>? _disposeFuture;
 
   /// The [Future] to wait for [_create] completion.
   /// This is used to prevent signaling [completer] (from [PlatformPlayer]) before [_create] completes in any hypothetical situation (because `idle-active` may fire before it).
@@ -2799,59 +2932,35 @@ class NativePlayer extends PlatformPlayer {
   static bool test = false;
 }
 
-// --------------------------------------------------
-
-class _ScreenshotData {
-  final int ctx;
-  final String lib;
+final class _ScreenshotData {
+  final int width;
+  final int height;
+  final int stride;
+  final Uint8List bytes;
   final String? format;
-  final bool includeLibassSubtitles;
 
   const _ScreenshotData(
-    this.ctx,
-    this.lib,
+    this.width,
+    this.height,
+    this.stride,
+    this.bytes,
     this.format,
-    this.includeLibassSubtitles,
   );
 }
 
-Uint8List? _screenshot(_ScreenshotData data) {
-  // ---------
-  final mpv = generated.MPV(DynamicLibrary.open(data.lib));
-  final ctx = Pointer<generated.mpv_handle>.fromAddress(data.ctx);
-  // ---------
-  final format = data.format;
-  final includeLibassSubtitles = data.includeLibassSubtitles;
-  // ---------
+final class _ScreenshotRequest {
+  final String? format;
+  final completer = Completer<_ScreenshotData?>();
+  _ScreenshotRequest(this.format);
+}
 
-  // https://mpv.io/manual/stable/#command-interface-screenshot-raw
-  final args = [
-    'screenshot-raw',
-    includeLibassSubtitles ? 'subtitles' : 'video',
-  ];
-
-  final result = calloc<generated.mpv_node>();
-
-  final pointers = args.map<Pointer<Utf8>>((e) {
-    return e.toNativeUtf8();
-  }).toList();
-  final Pointer<Pointer<Utf8>> arr = calloc.allocate(args.join().length);
-  for (int i = 0; i < args.length; i++) {
-    arr[i] = pointers[i];
-  }
-  mpv.mpv_command_ret(
-    ctx,
-    arr.cast(),
-    result.cast(),
-  );
-
-  Uint8List? image;
-
-  if (result.ref.format == generated.mpv_format.MPV_FORMAT_NODE_MAP) {
+// This node belongs to the current mpv event. Copy before wait_event reuses it.
+_ScreenshotData? _copyScreenshot(generated.mpv_node result, String? format) {
+  if (result.format == generated.mpv_format.MPV_FORMAT_NODE_MAP) {
     int? w, h, stride;
     Uint8List? bytes;
 
-    final map = result.ref.u.list;
+    final map = result.u.list;
     for (int i = 0; i < map.ref.num; i++) {
       final key = map.ref.keys[i].cast<Utf8>().toDartString();
       final value = map.ref.values[i];
@@ -2881,59 +2990,26 @@ Uint8List? _screenshot(_ScreenshotData data) {
     }
 
     if (w != null && h != null && stride != null && bytes != null) {
-      switch (format) {
-        case 'image/jpeg':
-          {
-            final pixels = Image(
-              width: w,
-              height: h,
-              numChannels: 3,
-            );
-            for (final pixel in pixels) {
-              final x = pixel.x;
-              final y = pixel.y;
-              final i = (y * stride) + (x * 4);
-              pixel.b = bytes[i];
-              pixel.g = bytes[i + 1];
-              pixel.r = bytes[i + 2];
-            }
-            image = encodeJpg(pixels);
-            break;
-          }
-        case 'image/png':
-          {
-            final pixels = Image(
-              width: w,
-              height: h,
-              numChannels: 3,
-            );
-            for (final pixel in pixels) {
-              final x = pixel.x;
-              final y = pixel.y;
-              final i = (y * stride) + (x * 4);
-              pixel.b = bytes[i];
-              pixel.g = bytes[i + 1];
-              pixel.r = bytes[i + 2];
-            }
-            image = encodePng(pixels);
-            break;
-          }
-        case null:
-          {
-            image = bytes.sublist(0);
-            break;
-          }
-      }
+      return _ScreenshotData(w, h, stride, Uint8List.fromList(bytes), format);
     }
   }
+  return null;
+}
 
-  pointers.forEach(calloc.free);
-  mpv.mpv_free_node_contents(result.cast());
-
-  calloc.free(arr);
-  calloc.free(result.cast());
-
-  return image;
+Uint8List? _encodeScreenshot(_ScreenshotData data) {
+  if (data.format == null) return data.bytes;
+  final pixels = Image(width: data.width, height: data.height, numChannels: 3);
+  for (final pixel in pixels) {
+    final offset = pixel.y * data.stride + pixel.x * 4;
+    pixel.b = data.bytes[offset];
+    pixel.g = data.bytes[offset + 1];
+    pixel.r = data.bytes[offset + 2];
+  }
+  return switch (data.format) {
+    'image/jpeg' => encodeJpg(pixels),
+    'image/png' => encodePng(pixels),
+    _ => throw ArgumentError.value(data.format, 'format'),
+  };
 }
 
 class _GetPlaylistData {

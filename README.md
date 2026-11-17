@@ -1,3 +1,9 @@
+# Aldoro Android TV branch
+
+This branch contains selected Android TV lifecycle and responsiveness fixes.
+See [ALDORO_PATCH.md](ALDORO_PATCH.md) for upstream/Predidit comparison, attribution,
+compatibility boundaries and regression checks.
+
 # [package:media_kit](https://github.com/media-kit/media-kit)
 
 #### A cross-platform video player & audio player for Flutter & Dart.

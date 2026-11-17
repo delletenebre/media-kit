@@ -33,9 +33,13 @@ class AndroidVideoController extends PlatformVideoController {
   /// [Lock] used to synchronize [onLoadHooks], [onUnloadHooks] & [subscription].
   final lock = Lock();
 
+  bool _disposed = false;
+  bool get _closing => _disposed || platform.disposed;
+
   NativePlayer get platform => player.platform as NativePlayer;
 
   Future<void> setProperty(String key, String value) async {
+    if (_closing) return;
     await platform.setProperty(key, value, waitForInitialization: false);
   }
 
@@ -48,6 +52,7 @@ class AndroidVideoController extends PlatformVideoController {
   /// Listener for updating the --wid property.
   Future<void> widListener() {
     return lock.synchronized(() async {
+      if (_closing) return;
       final width = rect.value?.width.toInt() ?? 1;
       final height = rect.value?.height.toInt() ?? 1;
       final androidSurfaceSizeValue = [width, height].join('x');
@@ -70,13 +75,30 @@ class AndroidVideoController extends PlatformVideoController {
       );
       // Instead of seeking to the start (Duration.zero), seek to the current playback position
       // without jumping the user to the start of the media.
-      final currentPosition = player.state.position;
-      await player.seek(currentPosition);
+      // Live streams cannot seek. Detaching a surface must not seek either.
+      // Query the demuxer rather than inferring seekability from duration.
+      if (_closing || widValue == '0') return;
+      final seekable = await platform.getProperty(
+        'seekable',
+        waitForInitialization: false,
+      );
+      if (_closing || seekable != 'yes') return;
+      // The controller lock owns this operation. Taking the player lock here
+      // can deadlock disposal, which holds it while draining this controller.
+      await platform.seek(player.state.position, synchronized: false);
     });
   }
 
   /// [StreamSubscription] for listening to video [Rect].
   StreamSubscription<VideoParams>? videoParamsSubscription;
+
+  @visibleForTesting
+  factory AndroidVideoController.test(
+      Player player, VideoControllerConfiguration configuration) {
+    final controller = AndroidVideoController._(player, configuration);
+    player.platform?.release.add(controller._dispose);
+    return controller;
+  }
 
   /// {@macro android_video_controller}
   AndroidVideoController._(
@@ -86,6 +108,7 @@ class AndroidVideoController extends PlatformVideoController {
     wid.addListener(widListener);
     videoParamsSubscription = player.stream.videoParams.listen(
       (event) => lock.synchronized(() async {
+        if (_closing) return;
         final int width;
         final int height;
         if (event.rotate == 0 || event.rotate == 180) {
@@ -114,6 +137,8 @@ class AndroidVideoController extends PlatformVideoController {
             'height': height.toString(),
           },
         );
+
+        if (_closing) return;
 
         rect.value = Rect.fromLTWH(
           0.0,
@@ -229,18 +254,19 @@ class AndroidVideoController extends PlatformVideoController {
 
   /// Disposes the instance. Releases allocated resources back to the system.
   Future<void> _dispose() async {
-    super.dispose();
-    wid.dispose();
+    _disposed = true;
     wid.removeListener(widListener);
     await videoParamsSubscription?.cancel();
-    final handle = await player.handle;
-    _controllers.remove(handle);
-    await _channel.invokeMethod(
-      'VideoOutputManager.Dispose',
-      {
-        'handle': handle.toString(),
-      },
-    );
+    await lock.synchronized(() async {
+      final handle = await player.handle;
+      _controllers.remove(handle);
+      await _channel.invokeMethod(
+        'VideoOutputManager.Dispose',
+        {'handle': handle.toString()},
+      );
+      wid.dispose();
+      super.dispose();
+    });
   }
 
   /// Currently created [AndroidVideoController]s.
